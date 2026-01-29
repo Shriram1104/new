@@ -1,0 +1,367 @@
+"""
+Tools for interacting with Vertex AI Datastores.
+These tools are used by agents to search for schemes.
+"""
+
+import time
+from typing import Dict, List, Any, Optional
+from google.cloud import discoveryengine_v1 as discoveryengine
+from google.api_core.exceptions import GoogleAPIError
+
+from config.settings import settings
+from utils.logger import setup_logger, log_datastore_query
+from collections.abc import Mapping
+
+logger = setup_logger(__name__)
+
+
+class DatastoreClient:
+    """Client for interacting with Vertex AI Datastores."""
+    
+    def __init__(self):
+        """Initialize datastore client."""
+        self.project_id = settings.google_cloud_project
+        self.location = settings.datastore_location
+        self.farmer_datastore_id = settings.farmer_datastore_id
+        self.msme_datastore_id = settings.msme_datastore_id
+        
+        # Initialize search client
+        self.client = discoveryengine.SearchServiceAsyncClient()
+    
+    def _get_serving_config(self, datastore_id: str) -> str:
+        """
+        Get serving config path for datastore.
+        
+        Args:
+            datastore_id: Datastore ID
+            
+        Returns:
+            Serving config path
+        """
+        return (
+            f"projects/{self.project_id}/locations/{self.location}/"
+            f"collections/default_collection/dataStores/{datastore_id}/"
+            f"servingConfigs/default_config"
+        )
+    
+    async def search(
+        self,
+        query: str,
+        datastore_id: str,
+        filters: Optional[Dict[str, Any]] = None,
+        max_results: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Search datastore for schemes.
+        
+        Args:
+            query: Search query
+            datastore_id: Datastore to search
+            filters: Optional filters (NOT USED - datastore doesn't support field filters)
+            max_results: Maximum number of results
+            
+        Returns:
+            List of scheme documents
+        """
+        start_time = time.time()
+        
+        try:
+            serving_config = self._get_serving_config(datastore_id)
+
+            request = discoveryengine.SearchRequest(
+                serving_config=serving_config,
+                query=query,
+                page_size=max_results,
+                query_expansion_spec=discoveryengine.SearchRequest.QueryExpansionSpec(
+                    condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.DISABLED
+                ),
+                spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
+                    mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+                ),
+            )
+            
+            # Execute search
+            response = await self.client.search(request)
+            
+            # Parse results
+            results = []
+            for result in response.results:
+                doc_data = self._parse_document(result.document)
+                if doc_data:
+                    results.append(doc_data)
+            
+            duration_ms = (time.time() - start_time) * 1000
+            log_datastore_query(
+                logger,
+                datastore_id,
+                query,
+                len(results),
+                duration_ms
+            )
+            
+            return results
+            
+        except GoogleAPIError as e:
+            logger.error(f"Datastore search error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error in datastore search: {e}")
+            return []
+    
+    def _build_filter_string(self, filters: Dict[str, Any]) -> str:
+        """
+        Build filter string for datastore query.
+        
+        Args:
+            filters: Filter dictionary
+            
+        Returns:
+            Filter string
+        """
+        filter_parts = []
+        
+        # Location filter - using nameOfState field from your datastore schema
+        if "state" in filters and filters["state"]:
+            filter_parts.append(f'nameOfState: ANY("{filters["state"]}")')
+        
+        # Gender filter
+        if "gender" in filters and filters["gender"]:
+            filter_parts.append(f'gender: ANY("{filters["gender"]}")')
+        
+        # Category filter (for farmers)
+        if "category" in filters and filters["category"]:
+            filter_parts.append(f'category: ANY("{filters["category"]}")')
+        
+        # Business type filter (for MSMEs)
+        if "business_type" in filters and filters["business_type"]:
+            filter_parts.append(f'business_type: ANY("{filters["business_type"]}")')
+        
+        return " AND ".join(filter_parts)
+    
+    def _parse_document(self, document) -> Optional[Dict[str, Any]]:
+        """
+        Parse document from search result.
+        
+        Args:
+            document: Document from search response
+            
+        Returns:
+            Parsed document dictionary matching your schema
+        """
+        try:
+            struct_data = document.struct_data
+            
+            # Extract data from your schema structure
+            data = struct_data.get("data", {})
+            
+            # Deep conversion function to handle all protobuf types
+            def make_json_safe(obj):
+                """Recursively convert protobuf objects to JSON-serializable Python types."""
+                if obj is None:
+                    return None
+                elif isinstance(obj, (str, int, float, bool)):
+                    return obj
+                # FIX: Check for Mapping (includes dict, Proto Maps, Structs)
+                elif isinstance(obj, Mapping):
+                    return {k: make_json_safe(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return [make_json_safe(item) for item in obj]
+                else:
+                    try:
+                        # This handles RepeatedComposite (lists)
+                        return [make_json_safe(item) for item in obj]
+                    except TypeError:
+                        return str(obj)  
+            
+            return {
+                "id": document.id,
+                "guid": make_json_safe(data.get("guid", "")),
+                "name": make_json_safe(data.get("name", "")),
+                "description": make_json_safe(data.get("description", "")),
+                "benefit_summary": make_json_safe(data.get("benefitSummary", "")),
+                "benefit": make_json_safe(data.get("benefit", [])),
+                "eligibility": make_json_safe(data.get("eligibility", [])),
+                "eligibility_criteria": make_json_safe(data.get("eligibilityCriteria", {})),
+                "process": make_json_safe(data.get("process", [])),
+                "document_checklist": make_json_safe(data.get("documentChecklist", [])),
+                "scheme_type": make_json_safe(data.get("schemeType", "")),
+                "department_agency": make_json_safe(data.get("departmentAgency", [])),
+                "service_type": make_json_safe(data.get("serviceType", [])),
+                "beneficiary_type": make_json_safe(data.get("beneficiaryType", [])),
+                "name_of_state": make_json_safe(data.get("nameOfState", [])),
+                "sdg_impacted": make_json_safe(data.get("sdgImpactedList", [])),
+            }
+        except Exception as e:
+            logger.error(f"Error parsing document: {e}")
+            return None
+
+
+# Global datastore client instance
+_datastore_client = None
+
+
+def get_datastore_client() -> DatastoreClient:
+    """Get or create datastore client singleton."""
+    global _datastore_client
+    if _datastore_client is None:
+        _datastore_client = DatastoreClient()
+    return _datastore_client
+
+
+# Tool functions for agents
+async def search_farmer_schemes(
+    query: str,
+    state: str = "",
+    category: str = "",
+    gender: str = ""
+) -> str:
+    """
+    Search for farmer schemes in the datastore.
+    
+    This tool searches the farmer schemes datastore and returns relevant schemes
+    based on the query. Include state, category, and gender in the query text for best results.
+    
+    Args:
+        query: Search query describing the farmer's needs (e.g., "loan schemes for wheat farmers")
+        state: State name (e.g., "Maharashtra", "Rajasthan") - will be added to query text
+        category: Farmer category (e.g., "small", "marginal", "medium") - will be added to query text
+        gender: Gender for targeting specific schemes (e.g., "male", "female") - will be added to query text
+        
+    Returns:
+        JSON string with list of schemes and count
+    """
+    import json
+    
+    client = get_datastore_client()
+    
+    # Build enhanced query by including filters in the query text
+    enhanced_query_parts = [query]
+    
+    if state:
+        enhanced_query_parts.append(state)
+    if category:
+        enhanced_query_parts.append(f"{category} farmer")
+    if gender:
+        enhanced_query_parts.append(f"{gender} farmer")
+    
+    enhanced_query = " ".join(enhanced_query_parts)
+    
+    # Search without filters (include context in query instead)
+    schemes = await client.search(
+        query=enhanced_query,
+        datastore_id=settings.farmer_datastore_id,
+        filters=None,  # Not used
+        max_results=3
+    )
+    
+    result = {
+        "schemes": schemes,
+        "count": len(schemes),
+        "query": enhanced_query,
+        "state": state,
+        "category": category
+    }
+    
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def search_msme_schemes(
+    query: str,
+    state: str = "",
+    business_type: str = "",
+    gender: str = ""
+) -> str:
+    """
+    Search for MSME schemes in the datastore.
+    
+    This tool searches the MSME schemes datastore and returns relevant schemes.
+    Include state, business type, and gender in the query for best results.
+    
+    Args:
+        query: Search query describing the business needs (e.g., "loan for textile business")
+        state: State name (e.g., "Maharashtra", "Rajasthan") - will be added to query text
+        business_type: Type of business (e.g., "manufacturing", "services", "trading") - will be added to query text
+        gender: Gender for women entrepreneurship schemes (e.g., "female") - will be added to query text
+        
+    Returns:
+        JSON string with list of schemes and count
+    """
+    import json
+    
+    client = get_datastore_client()
+    
+    # Build enhanced query by including filters in the query text
+    logger.info(f"msme query: {query}")
+    enhanced_query_parts = [query]
+    
+    if state:
+        enhanced_query_parts.append(state)
+    if business_type:
+        enhanced_query_parts.append(business_type)
+    if gender and gender.lower() == "female":
+        enhanced_query_parts.append("women entrepreneur")
+    
+    enhanced_query = " ".join(enhanced_query_parts)
+
+    logger.info(f"enhanced query: {enhanced_query}")
+    
+    # Search without filters (include context in query instead)
+    schemes = await client.search(
+        query=enhanced_query,
+        datastore_id=settings.msme_datastore_id,
+        filters=None,  # Not used
+        max_results=3
+    )
+    
+    result = {
+        "schemes": schemes,
+        "count": len(schemes),
+        "query": enhanced_query,
+        "state": state,
+        "business_type": business_type
+    }
+    
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def get_scheme_details(scheme_id: str, datastore_type: str) -> str:
+    """
+    Get detailed information about a specific scheme.
+    
+    This tool retrieves comprehensive details about a scheme including
+    the application process, required documents, and contact information.
+    
+    Args:
+        scheme_id: Unique identifier of the scheme
+        datastore_type: Type of datastore - either "farmer" or "msme"
+        
+    Returns:
+        JSON string with detailed scheme information
+    """
+    import json
+    
+    client = get_datastore_client()
+    
+    # Determine which datastore to use
+    datastore_id = (
+        settings.farmer_datastore_id if datastore_type == "farmer"
+        else settings.msme_datastore_id
+    )
+    
+    # Search for specific scheme by ID
+    schemes = await client.search(
+        query=scheme_id,
+        datastore_id=datastore_id,
+        max_results=10
+    )
+
+    for scheme in schemes:
+        if scheme.get("id") == scheme_id:
+             return json.dumps(scheme)
+        if scheme.get("id") != "farmers-schemes-list" and scheme.get("name"):
+             return json.dumps(scheme)
+    
+    return json.dumps({
+        "error": "Scheme not found",
+        "scheme_id": scheme_id
+    })
